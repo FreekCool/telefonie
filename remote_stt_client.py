@@ -1,8 +1,19 @@
 # remote_stt_client.py
 import io
 import wave
-import audioop
 from typing import Optional
+
+# Handle audioop deprecation in Python 3.13+
+try:
+    import audioop
+except ImportError:
+    try:
+        import pyaudioop as audioop
+    except ImportError:
+        raise ImportError(
+            "audioop module not found. Please install pyaudioop: pip install pyaudioop\n"
+            "Or use Python 3.11/3.12 where audioop is built-in."
+        )
 
 import requests
 import httpx
@@ -66,10 +77,12 @@ class RemoteSpeechToText:
         j = resp.json()
         return (j.get("text") or "").strip()
     
-    async def transcribe_pcm_async(self, pcm_bytes: bytes, sample_rate: int = 8000) -> str:
+    async def transcribe_pcm_async(self, pcm_bytes: bytes, sample_rate: int = 8000, initial_prompt: Optional[str] = None) -> str:
         """
         Async version: non-blocking HTTP call for faster processing.
         Convert PCM16 mono -> 16 kHz WAV -> POST to /transcribe.
+        
+        initial_prompt: Optional context to help Whisper with domain-specific vocabulary.
         """
         if not pcm_bytes:
             return ""
@@ -94,9 +107,13 @@ class RemoteSpeechToText:
         data = {
             "language": self.language,
         }
+        if initial_prompt:
+            data["initial_prompt"] = initial_prompt
 
         url = f"{self.base_url}/transcribe"
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # Use longer timeout for Whisper API (transcription can take time)
+        timeout = httpx.Timeout(60.0, connect=10.0)  # 60s total, 10s to connect
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, files=files, data=data)
             resp.raise_for_status()
             j = resp.json()

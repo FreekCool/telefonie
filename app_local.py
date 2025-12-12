@@ -66,11 +66,40 @@ tts = TextToSpeech(
     model_path="piper_models/nl_BE-nathalie-medium.onnx",
 )
 
-SYSTEM_PROMPT = (
+# -------------------------------------------------
+# system prompt + greeting from files
+# -------------------------------------------------
+
+def load_text_file(filepath: str, default: str = "") -> str:
+    """
+    Load text from a file, with fallback to default if file doesn't exist.
+    """
+    try:
+        path = Path(filepath)
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+        else:
+            print(f"Warning: {filepath} not found, using default.")
+            return default
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}, using default.")
+        return default
+
+
+SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "system_prompt.txt")
+SYSTEM_PROMPT_DEFAULT = (
     "Je bent een vriendelijke Nederlandse telefonische assistent. "
     "Antwoord in 1 of 2 korte zinnen, duidelijk en beleefd. "
     "Geen opsommingen, geen lijstjes."
 )
+SYSTEM_PROMPT = load_text_file(SYSTEM_PROMPT_PATH, SYSTEM_PROMPT_DEFAULT)
+
+GREETING_PATH = os.getenv("GREETING_PATH", "greeting.txt")
+GREETING_DEFAULT = (
+    "Hallo, je spreekt met jouw telefonische assistent. "
+    "Wat kan ik voor je doen?"
+)
+GREETING = load_text_file(GREETING_PATH, GREETING_DEFAULT)
 
 # --- VAD / turn-taking constants (tuned to be a bit snappier) ---
 
@@ -487,10 +516,7 @@ async def handle_media_stream(websocket: WebSocket):
                 call_sid_from_param = data["start"].get("customParameters", {}).get("callSid")
                 print(f"Stream started {stream_sid} CallSid={call_sid_from_param}")
 
-                greeting = (
-                    "Hallo, je spreekt met jou telefonische assistent. "
-                    "Wat kan ik voor je doen?"
-                )
+                greeting = GREETING
                 if tts_task and not tts_task.done():
                     stop_playback.set()
                     tts_task.cancel()
@@ -593,7 +619,17 @@ async def handle_media_stream(websocket: WebSocket):
                         continue
 
                     # --- STT via Runpod Whisper (async for non-blocking) ---
-                    user_text = await stt.transcribe_pcm_async(pcm_all, sample_rate=8000)
+                    # Provide context to improve accuracy for restaurant/reservation vocabulary
+                    whisper_prompt = (
+                        "Restaurant telefoongesprek. Belangrijke woorden: reservering, reserveren, "
+                        "bestelling, menu, pizzeria, tafel, personen, datum, tijd, naam, adres, "
+                        "bezorgen, ophalen, allergie, lactose."
+                    )
+                    user_text = await stt.transcribe_pcm_async(
+                        pcm_all, 
+                        sample_rate=8000,
+                        initial_prompt=whisper_prompt
+                    )
                     print("User said:", repr(user_text))
 
                     if not user_text.strip():
@@ -604,9 +640,10 @@ async def handle_media_stream(websocket: WebSocket):
 
                     # --- LLM (Mistral) with balanced history for quality/speed ---
                     conversation.append({"role": "user", "content": user_text})
-                    # keep only system + last 2 exchanges (4 msgs) for good context without too much latency
-                    if len(conversation) > 1 + 4:
-                        conversation = [conversation[0]] + conversation[-4:]
+                    # keep only system + last 6 exchanges (12 msgs) for better context tracking
+                    # This prevents the model from forgetting information like number of people, date, time
+                    if len(conversation) > 1 + 12:
+                        conversation = [conversation[0]] + conversation[-12:]
 
                     # --- TTS -> Twilio (background, barge-in aware, streaming) ---
                     if tts_task and not tts_task.done():

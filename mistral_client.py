@@ -202,28 +202,40 @@ async def chat_mistral_stream_async(
         "stream": True,
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream(
-            "POST",
-            "https://api.mistral.ai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                if line.startswith("data: "):
-                    data_str = line[6:]  # Remove "data: " prefix
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        import json
-                        data = json.loads(data_str)
-                        if "choices" in data and len(data["choices"]) > 0:
-                            delta = data["choices"][0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                yield content
-                    except json.JSONDecodeError:
+    try:
+        timeout_config = httpx.Timeout(timeout, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            async with client.stream(
+                "POST",
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
                         continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            import json
+                            data = json.loads(data_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                        except json.JSONDecodeError as e:
+                            # Skip malformed JSON lines
+                            continue
+                        except Exception as e:
+                            print(f"Error parsing stream chunk: {e}")
+                            continue
+    except httpx.TimeoutException as e:
+        raise RuntimeError(f"Mistral streaming timeout after {timeout}s") from e
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"Mistral API error: {e.response.status_code} - {e.response.text}") from e
+    except Exception as e:
+        raise RuntimeError(f"Mistral streaming error: {type(e).__name__}: {e}") from e

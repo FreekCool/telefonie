@@ -2,8 +2,19 @@
 from pathlib import Path
 import subprocess
 import tempfile
-import audioop
 from typing import Tuple
+
+# Handle audioop deprecation in Python 3.13+
+try:
+    import audioop
+except ImportError:
+    try:
+        import pyaudioop as audioop
+    except ImportError:
+        raise ImportError(
+            "audioop module not found. Please install pyaudioop: pip install pyaudioop\n"
+            "Or use Python 3.11/3.12 where audioop is built-in."
+        )
 
 import soundfile as sf
 from faster_whisper import WhisperModel

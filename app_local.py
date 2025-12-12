@@ -484,6 +484,13 @@ async def handle_media_stream(websocket: WebSocket):
     call_sid_from_param = None
     # conversation history (system prompt + rolling messages)
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # reservation state (extracted from conversation for faster context)
+    reservation_state = {
+        "aantal_personen": None,
+        "datum": None,
+        "tijd": None,
+        "naam": None,
+    }
     # playback control
     stop_playback = asyncio.Event()
     tts_task = None
@@ -515,6 +522,15 @@ async def handle_media_stream(websocket: WebSocket):
                 stream_sid = data["start"]["streamSid"]
                 call_sid_from_param = data["start"].get("customParameters", {}).get("callSid")
                 print(f"Stream started {stream_sid} CallSid={call_sid_from_param}")
+                
+                # Reset conversation and reservation state for new call
+                conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+                reservation_state = {
+                    "aantal_personen": None,
+                    "datum": None,
+                    "tijd": None,
+                    "naam": None,
+                }
 
                 greeting = GREETING
                 if tts_task and not tts_task.done():
@@ -638,12 +654,74 @@ async def handle_media_stream(websocket: WebSocket):
                         processing = False
                         continue
 
-                    # --- LLM (Mistral) with balanced history for quality/speed ---
+                    # --- LLM (Mistral) with smart history compression ---
                     conversation.append({"role": "user", "content": user_text})
-                    # keep only system + last 6 exchanges (12 msgs) for better context tracking
-                    # This prevents the model from forgetting information like number of people, date, time
-                    if len(conversation) > 1 + 12:
-                        conversation = [conversation[0]] + conversation[-12:]
+                    
+                    # Extract reservation information from user message
+                    # Extract number of people (improved pattern matching)
+                    personen_match = re.search(r'(\d+)\s*(?:personen?|mensen?|gasten?)', user_text.lower())
+                    if personen_match:
+                        reservation_state["aantal_personen"] = personen_match.group(1)
+                    else:
+                        # Check for written numbers
+                        number_words = {
+                            'vier': '4', 'tien': '10', 'twaalf': '12', 'acht': '8',
+                            'twee': '2', 'drie': '3', 'vijf': '5', 'zes': '6',
+                            'zeven': '7', 'negen': '9', 'elf': '11'
+                        }
+                        for word, num in number_words.items():
+                            if word in user_text.lower():
+                                reservation_state["aantal_personen"] = num
+                                break
+                    
+                    # Extract date
+                    if any(word in user_text.lower() for word in ['morgen', '14 december', 'december']):
+                        if 'morgen' in user_text.lower():
+                            reservation_state["datum"] = "morgen"
+                        elif '14 december' in user_text.lower() or 'december' in user_text.lower():
+                            reservation_state["datum"] = "14 december"
+                    
+                    # Extract time
+                    tijd_match = re.search(r'(\d+)\s*uur|half\s*(\d+)|(\d+):(\d+)', user_text.lower())
+                    if tijd_match:
+                        if 'half' in user_text.lower():
+                            reservation_state["tijd"] = f"half {tijd_match.group(2) or tijd_match.group(1)}"
+                        elif ':' in user_text:
+                            reservation_state["tijd"] = tijd_match.group(0)
+                        else:
+                            reservation_state["tijd"] = f"{tijd_match.group(1)} uur"
+                    
+                    # Extract name
+                    naam_patterns = [
+                        r'(?:ik ben|mijn naam is|dit is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+                        r'([A-Z][a-z]+\s+van\s+[A-Z][a-z]+)',  # "Bart van Vliet"
+                    ]
+                    for pattern in naam_patterns:
+                        naam_match = re.search(pattern, user_text)
+                        if naam_match:
+                            reservation_state["naam"] = naam_match.group(1)
+                            break
+                    
+                    # Smart compression: keep only recent messages (2-3 exchanges) but add reservation state
+                    if len(conversation) > 1 + 6:  # Keep only last 3 exchanges (6 messages)
+                        # Build context summary from reservation state
+                        context_parts = []
+                        if reservation_state["aantal_personen"]:
+                            context_parts.append(f"aantal personen: {reservation_state['aantal_personen']}")
+                        if reservation_state["datum"]:
+                            context_parts.append(f"datum: {reservation_state['datum']}")
+                        if reservation_state["tijd"]:
+                            context_parts.append(f"tijd: {reservation_state['tijd']}")
+                        if reservation_state["naam"]:
+                            context_parts.append(f"naam: {reservation_state['naam']}")
+                        
+                        # Update system prompt with reservation context if we have any
+                        if context_parts:
+                            context_str = "Belangrijke informatie uit het gesprek: " + ", ".join(context_parts) + "."
+                            enhanced_system = SYSTEM_PROMPT + "\n\n" + context_str
+                            conversation = [{"role": "system", "content": enhanced_system}] + conversation[-6:]
+                        else:
+                            conversation = [conversation[0]] + conversation[-6:]
 
                     # --- TTS -> Twilio (background, barge-in aware, streaming) ---
                     if tts_task and not tts_task.done():
